@@ -1,0 +1,8 @@
+{
+    "pairs": "/share/apps/seqqs-0.01/pairs",
+    "seqqs": "/share/apps/seqqs-0.01/seqqs",
+    "scythe": "/share/apps/scythe-0.991/scythe",
+    "seqtk": "/home/vince251/bin//seqtk",
+    "bwa": "/share/apps/bwa-0.7.5a/bwa",
+    "samtools": "/share/apps/samtools-0.1.19/bin/samtools"
+}
