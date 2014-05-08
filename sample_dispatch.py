@@ -63,7 +63,7 @@ def merge_steps(collection, steps):
     parts = [step.strip() for key, step in collection.items() if key in steps]
     return " ".join(parts)
 
-def build_sample_command(sample_params, scythe, trimfq, pre_seqqs, post_seqqs):
+def build_sample_command(sample_params):
     """
     Construct a read pair preprocessing and alignment command from
     templates and ordered steps.
@@ -73,8 +73,7 @@ def build_sample_command(sample_params, scythe, trimfq, pre_seqqs, post_seqqs):
                             ("pipefail", "interleave")))
 
     # preprocessing includes many optional components
-    preprocess_step_keys = {"scythe": scythe, "trimfq":trimfq,
-                           "pre_seqqs":pre_seqqs, "post_seqqs":post_seqqs}
+    preprocess_step_keys = sample_params["preprocess-steps"]
     steps.append(merge_steps(PREPROCESSING_STEPS,
                             [k for k, v in preprocess_step_keys.items() if v]))
 
@@ -183,6 +182,13 @@ def dispatch(args):
                                 prior=str(args.prior), error=args.trim_error,
                                 stats_dir=args.stats, nthreads=args.threads,
                                 mem=args.mem, bam_dir=args.bam_dir)
+
+    # which preprocess steps to use
+    global_sample_config["preprocess-steps"] = list()
+    for step in PREPROCESSING_STEPS:
+        if step in args:
+            global_sample_config["preprocess-steps"].append(step)
+
     global_params = dict(global_sample_config.items() + setup_params.items())
     sample_config = "%s_samples.txt" % args.job
     samples = create_sample_config(args.samples, sample_config, global_params)
@@ -225,9 +231,7 @@ def runner(args):
     runner_log = Logger("%s logger" % sample)
 
     # preprocessing and alignment
-    aln_cmd = build_sample_command(sample_params, scythe=args.scythe,
-                                    trimfq=args.trimfq, pre_seqqs=args.seqqs,
-                                    post_seqqs=args.seqqs)
+    aln_cmd = build_sample_command(sample_params)
 
     runner_log.info("%s starting preprocessing and alignment of sample." % sample)
     runner_log.info("%s command: %s" % (sample, aln_cmd))
