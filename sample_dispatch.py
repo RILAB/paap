@@ -1,5 +1,5 @@
 import os
-
+import argparse
 import sys
 from subprocess import PIPE, Popen, CalledProcessError, check_call, check_output
 import re
@@ -7,21 +7,36 @@ import json
 import time
 from datetime import datetime
 from logbook import Logger
+from collections import OrderedDict
 
 DEVNULL = open(os.devnull, 'wb')
 
-SAMPLE_PROCESS_PROGRAMS = ["pairs", "seqqs", "scythe", "seqtk", "bwa", "samtools"]
+### Pipeline Components ###
 
-SAMPLE_PROCESS_CMD = """\
-set -o pipefail; \
-{pairs} join {reads1} {reads2} | \
-{seqqs} -i -p {stats_dir}/raw_{sample_id} -e - | \
-{scythe} -a {adapters_file} -p {prior} - | \
-{seqtk} trimfq -q {error} - | \
-{seqqs} -i -p {stats_dir}/processed_{sample_id} -e - | \
-{bwa} mem -M -t {nthreads} -R '@RG\tID:{read_id}\tPL:illumina\tSM:{sample_id}' -v 1 -p {reference} - | \
-{samtools} view -b -S -u - | samtools sort -@ {nthreads} -m {mem}M - {bam_dir}/{sample_id}.sorted \
-"""
+## Pipeline Initilization
+PIPE_INITIALIZATION_STEPS = OrderedDict([
+        ("pipefail", "set -o pipefail; "),
+        ("interleave", "{pairs} join {reads1} {reads2} | ")])
+
+## Pre-processing Steps
+# these are optional; keys correspond to CL args
+PREPROCESSING_STEPS = OrderedDict([
+        ("pre_seqqs", "{seqqs} -i -p {stats_dir}/raw_{sample_id} -e - | "),
+        ("scythe", "{scythe} -a {adapters_file} -p {prior} - | "),
+        ("trimfq", "{seqtk} trimfq -q {error} - | "),
+        ("post_seqqs", "{seqqs} -i -p {stats_dir}/processed_{sample_id} -e - | ")])
+
+## Alignment Steps
+# alignment and post_alignment steps required
+ALN_STEPS = OrderedDict([
+        ("bwa", "{bwa} mem -M -t {nthreads} -R '@RG\tID:{read_id}\tPL:illumina\tSM:{sample_id}' -v 1 -p {reference} - | ")])
+
+## Post-Alignment Steps
+POST_ALN_STEPS = OrderedDict([
+        ("samtools-to-bam", "{samtools} view -b -S -u - > {bam_dir}/{sample_id}.bam")])
+
+SORT_STEPS = OrderedDict([
+        ("samtools-sort", "samtools sort -@ {nthreads} -m {mem}M {bam_dir}/{sample_id}.bam {bam_dir}/{sample_id}_sorted")])
 
 SLURM_BATCH = """\
 #!/bin/bash
@@ -37,6 +52,38 @@ module load bwa samtools seqqs scythe
 
 sed -n "$SLURM_ARRAY_TASK_ID"p {sample_config} | python {sample_dispatch_py} runner
 """
+
+def merge_steps(collection, steps):
+    """
+    Given a collection of processing steps, merge those specified
+    by steps, creating a command. No checking; it's responsibility
+    of collection to ensure parts are interoperable.
+    """
+    steps = set(steps)
+    parts = [step.strip() for key, step in collection.items() if key in steps]
+    return " ".join(parts)
+
+def build_sample_command(sample_params, scythe, trimfq, pre_seqqs, post_seqqs):
+    """
+    Construct a read pair preprocessing and alignment command from
+    templates and ordered steps.
+    """
+    steps = list()
+    steps.append(merge_steps(PIPE_INITIALIZATION_STEPS,
+                            ("pipefail", "interleave")))
+
+    # preprocessing includes many optional components
+    preprocess_step_keys = {"scythe": scythe, "trimfq":trimfq,
+                           "pre_seqqs":pre_seqqs, "post_seqqs":post_seqqs}
+    steps.append(merge_steps(PREPROCESSING_STEPS,
+                            [k for k, v in preprocess_step_keys.items() if v]))
+
+    # these components are (so far) not optional
+    steps.append(ALN_STEPS["bwa"])
+    steps.append(POST_ALN_STEPS["samtools-to-bam"])
+    steps.append(SORT_STEPS["samtools-sort"])
+    return " ".join(steps)
+
 
 def validate_program_exists(command):
     p = check_call("command -v %s" % command, shell=True, stdout=DEVNULL, stderr=DEVNULL)
@@ -56,12 +103,12 @@ def get_template_keys(cmd):
 
 def safe_templater(cmd, mapping):
     """
-    A safer version of str.format, but checks that all keys are being used.
+    A safer version of str.format, but checks that no template keys are unfilled.
     """
     template_keys = get_template_keys(cmd)
-    key_symdiff = set(template_keys).symmetric_difference(set(mapping))
-    if len(key_symdiff):
-        raise ValueError("command template's keys are not identical to keys in mapping: " + ', '.join(key_symdiff))
+    key_diff = set(template_keys) - set(mapping)
+    if len(key_diff):
+        raise ValueError("command template's keys contain keys in mapping: " + ', '.join(key_diff))
     return cmd.format(**mapping)
 
 def validate_setupfile(setup_params):
@@ -100,6 +147,11 @@ def create_sample_config(sample_file, json_out_file, global_params):
     config_file = open(json_out_file, 'w')
     for line in sample_file:
         sample_id, read_id, reads1, reads2 = line.strip().split("\t")
+        reads_exist = dict([(read, os.path.isfile(read)) for read in (reads1, reads2)])
+        if not all(reads_exist.values()):
+            msg = ', '.join(["'%s'" % read for read, found in reads_exist.items() if not found])
+            logger.critical("reads file(s) %s not found." % msg)
+            sys.exit(1)
         this_sample_config = dict(sample_id=sample_id, read_id=read_id, reads1=reads1, reads2=reads2)
         combined_sample_config = dict(global_params.items() + this_sample_config.items())
         sample_config[sample_id] = combined_sample_config
@@ -123,8 +175,12 @@ def dispatch(args):
     validate_directory(args.stats, dispatch_log)
     validate_directory(args.bam_dir, dispatch_log)
 
+    if args.scythe and args.adapter is None:
+        raise argparse.ArgumentError("with --scythe, --adapter needs to be specified.")
+
     # create sample config JSON file, starting off with global config passed through args
-    global_sample_config = dict(reference=args.ref, adapters_file=args.adapter, prior=str(args.prior), error=args.trim_error,
+    global_sample_config = dict(reference=args.ref, adapters_file=args.adapter,
+                                prior=str(args.prior), error=args.trim_error,
                                 stats_dir=args.stats, nthreads=args.threads,
                                 mem=args.mem, bam_dir=args.bam_dir)
     global_params = dict(global_sample_config.items() + setup_params.items())
@@ -143,11 +199,16 @@ def dispatch(args):
     if not args.dry_run:
         # now, start the batch script
         dispatch_log.info("submitting sbatch script '%s'." % batch_file)
-        retcode = check_call(["sbatch", batch_file])
+        sbatch_cmd = ["sbatch"]
+        if args.email is not None:
+            sbatch_cmd.extend(["--mail-type", "ALL"])
+            sbatch_cmd.extend(["--mail-user", args.email])
+        sbatch_cmd.append(batch_file)
+        retcode = check_call(sbatch_cmd)
         if retcode != 0:
             dispatch_log.critical("submitting batch script '%s' exited abnormally with return code %d." % (batch_file, retcode))
             sys.exit(retcode.returncode)
-        dispatch_log.critical("submitting sbatch script '%s' complete." % batch_file)
+        dispatch_log.info("submitting sbatch script '%s' complete." % batch_file)
 
 def runner(args):
     """
@@ -163,51 +224,88 @@ def runner(args):
     sample = sample_params["sample_id"]
     runner_log = Logger("%s logger" % sample)
 
-    cmd = safe_templater(SAMPLE_PROCESS_CMD, sample_params)
+    # preprocessing and alignment
+    aln_cmd = build_sample_command(sample_params, scythe=args.scythe,
+                                    trimfq=args.trimfq, pre_seqqs=args.seqqs,
+                                    post_seqqs=args.seqqs)
+
     runner_log.info("%s starting preprocessing and alignment of sample." % sample)
+    runner_log.info("%s command: %s" % (sample, aln_cmd))
     if args.dry_run:
-        runner_log.debug("%s command: %s" % (sample, cmd))
         return
-    tstart = time.time()
-    p = Popen(cmd, shell=True, executable=find_bash())
+
+    tstart = datetime.datetime.now()
+    p = Popen(aln_cmd, shell=True, executable=find_bash())
     p.wait()
     if p.returncode != 0:
         # make this as loud as possible so Slurm can handle it
         runner_log.critical("%s exited abnormally with return code %d." % (sample, p.returncode))
         sys.exit(p.returncode)
-    tend = time.time()
+    tend = datetime.datetime.now()
     elapsed = tend - tstart
-    runner_log.info("%s completed preprocessing and alignment in %s seconds." % (sample, str(round(elapsed, 5))))
+    runner_log.info("%s completed preprocessing and alignment in: %s" % (sample, str(elapsed)))
+
+    tstart = datetime.datetime.now()
+    # BAM file sort
+    sort_cmd = safe_templater(SORT_STEPS['samtools-sort'], sample_params)
+    runner_log.info("%s starting sorting of BAM file." % sample)
+    runner_log.info("%s command: %s" % (sample, sort_cmd))
+    tend = datetime.datetime.now()
+    elapsed = tend - tstart
+    runner_log.info("%s completed sorting in: %s." % (sample, str(elapsed)))
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description='Dispatch a set of samples to be preprocessed and aligned.')
     parser.add_argument('--dry-run', '-n', help="don't run", action="store_true", default=False)
     subparsers = parser.add_subparsers(help='sub-command help')
     parser_dispatch = subparsers.add_parser('dispatch', help='create a set of samples in JSON format to dispatch')
     parser_dispatch.add_argument('--ref', '-r', help="reference FASTA file, indexed by BWA", required=True)
-    parser_dispatch.add_argument('--samples', '-s', help="tab-delimited sample sheet", required=True,
+
+    # optional preprocessing steps
+    preprocess = parser_dispatch.add_argument_group("pre-process",
+            "steps to run during pre-processing")
+    preprocess.add_argument('--trimfq', '-T', help="quality trim sequences with seqtk's trimfq",
+                           default=False, action="store_true")
+    preprocess.add_argument('--scythe', '-Y', help="trim adapter sequences with Scythe",
+                           default=False, action="store_true")
+    preprocess.add_argument('--pre-seqqs', '-q', default=False, action="store_true",
+                           help="run seqqs before pre-processing to record statistics about quality")
+    preprocess.add_argument('--post-seqqs', '-Q', default=False, action="store_true",
+                           help="run seqqs after pre-processing to record statistics about quality")
+    preprocess.add_argument('--adapter', '-a', help="adapter file (for scythe", default=None)
+    preprocess.add_argument('--prior', '-p', help="prior adapter contamination rate (for scythe)",
+                           type=float, default=0.3)
+    preprocess.add_argument('--trim-error', '-e', help="trimmer error rate threshold (for seqtk trimfq)")
+
+    # general configurations
+    general_options = parser_dispatch.add_argument_group("general",
+            "general options in pre-processing and alignment")
+    general_options.add_argument('--samples', '-s', help="tab-delimited sample sheet", required=True,
                                 type=argparse.FileType('r'))
-    parser_dispatch.add_argument('--adapter', '-a', help="adapter file (for scythe", required=True)
-    parser_dispatch.add_argument('--prior', '-p', help="prior adapter contamination rate (for scythe)",
-                                type=float, default=0.3)
-    parser_dispatch.add_argument('--trim-error', '-e', help="trimmer error rate threshold (for seqtk trimfq)",
-                                type=float, default=0.05)
-    parser_dispatch.add_argument('--log', '-l', help="directory for logging", default="log/")
-    parser_dispatch.add_argument('--stats', '-d', help="directory for diagnostic statistics files", default="stats/")
-    parser_dispatch.add_argument('--bam-dir', '-b', help="directory for output BAM files", required=True)
-    parser_dispatch.add_argument('--mem', '-m', help="memory (in MB) to use *per* thread in sorting", type=int, default=768)
-    parser_dispatch.add_argument('--threads', '-t', help="threads to use in alignment and sorting", default=1, type=int)
-    parser_dispatch.add_argument('--setup', '-S', help="setup JSON file (with file paths to programs)", required=True,
+    general_options.add_argument('--log', '-l', help="directory for logging", default="log/")
+    general_options.add_argument('--stats', '-d',
+                                help="directory for diagnostic statistics files", default="stats/")
+    general_options.add_argument('--bam-dir', '-b', help="directory for output BAM files", required=True)
+    general_options.add_argument('--mem', '-m', help="memory (in MB) to use *per* thread in sorting",
+                                type=int, default=768)
+    general_options.add_argument('--threads', '-t', help="threads to use in alignment and sorting",
+                                default=1, type=int)
+    general_options.add_argument('--setup', '-S', help="setup JSON file (with file paths to programs)",
+                                required=True,
                                 type=argparse.FileType('r'))
-    parser_dispatch.add_argument('--job', '-j', help="job name", required=True)
-    parser_dispatch.add_argument('--partition', '-P', help="Slurm partition", required=True)
+    general_options.add_argument('--job', '-j', help="job name", required=True)
+    general_options.add_argument('--partition', '-P', help="Slurm partition", required=True)
+    general_options.add_argument('--email', '-E', help="your email address for event notification",
+            default=None)
+
     parser_dispatch.set_defaults(func=dispatch)
 
-    parser_runner = subparsers.add_parser('runner', help="take a single sample JSON entry from standard in and process")
-    parser_runner.add_argument('config', help="config file argument (for debugging, normally passed through standard in)",
-                               default=None, nargs='?', type=argparse.FileType('r'))
+    # Runner: for internal use
+    parser_runner = subparsers.add_parser('runner',
+        help="interal use; runs samples serialized as JSON through pipeline")
+    parser_runner.add_argument('config',
+        help="config file argument (for debugging, normally passed through standard in)",
+        default=None, nargs='?', type=argparse.FileType('r'))
     parser_runner.set_defaults(func=runner)
 
     args = parser.parse_args()
