@@ -74,8 +74,7 @@ def build_sample_command(sample_params):
 
     # preprocessing includes many optional components
     preprocess_step_keys = sample_params["preprocess-steps"]
-    steps.append(merge_steps(PREPROCESSING_STEPS,
-                            [k for k, v in preprocess_step_keys.items() if v]))
+    steps.append(merge_steps(PREPROCESSING_STEPS, preprocess_step_keys)
 
     # these components are (so far) not optional
     steps.append(ALN_STEPS["bwa"])
