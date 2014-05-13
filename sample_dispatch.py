@@ -4,8 +4,7 @@ import sys
 from subprocess import PIPE, Popen, CalledProcessError, check_call, check_output
 import re
 import json
-import time
-from datetime import datetime
+import datetime
 from logbook import Logger
 from collections import OrderedDict
 
@@ -22,19 +21,18 @@ PIPE_INITIALIZATION_STEPS = OrderedDict([
 # these are optional; keys correspond to CL args
 PREPROCESSING_STEPS = OrderedDict([
         ("pre_seqqs", "{seqqs} -i -p {stats_dir}/raw_{sample_id} -e - | "),
-        ("scythe", "{scythe} -a {adapters_file} -p {prior} - | "),
+        ("scythe", "{scythe} -a {adapters_file} -p {prior} - 2> {stats_dir}/scythe_{sample_id}.txt | "),
         ("trimfq", "{seqtk} trimfq -q {error} - | "),
         ("post_seqqs", "{seqqs} -i -p {stats_dir}/processed_{sample_id} -e - | ")])
 
-## Alignment Steps
+## Alignment Steps and Post-Alignment Steps
 # alignment and post_alignment steps required
 ALN_STEPS = OrderedDict([
         ("bwa", "{bwa} mem -M -t {nthreads} -R '@RG\tID:{read_id}\tPL:illumina\tSM:{sample_id}' -v 1 -p {reference} - | ")])
-
-## Post-Alignment Steps
 POST_ALN_STEPS = OrderedDict([
         ("samtools-to-bam", "{samtools} view -b -S -u - > {bam_dir}/{sample_id}.bam")])
 
+## Sort step (run not in pipe, as this causes memory issues)
 SORT_STEPS = OrderedDict([
         ("samtools-sort", "samtools sort -@ {nthreads} -m {mem}M {bam_dir}/{sample_id}.bam {bam_dir}/{sample_id}_sorted")])
 
@@ -63,7 +61,7 @@ def merge_steps(collection, steps):
     parts = [step.strip() for key, step in collection.items() if key in steps]
     return " ".join(parts)
 
-def build_sample_command(sample_params):
+def build_sample_aln_command(sample_params):
     """
     Construct a read pair preprocessing and alignment command from
     templates and ordered steps.
@@ -73,15 +71,13 @@ def build_sample_command(sample_params):
                             ("pipefail", "interleave")))
 
     # preprocessing includes many optional components
-    preprocess_step_keys = sample_params["preprocess-steps"]
-    steps.append(merge_steps(PREPROCESSING_STEPS, preprocess_step_keys)
+    steps.append(merge_steps(PREPROCESSING_STEPS, sample_params["preprocess-steps"]))
 
     # these components are (so far) not optional
     steps.append(ALN_STEPS["bwa"])
     steps.append(POST_ALN_STEPS["samtools-to-bam"])
-    steps.append(SORT_STEPS["samtools-sort"])
-    return " ".join(steps)
-
+    cmd_template = " ".join(steps)
+    return safe_templater(cmd_template, sample_params)
 
 def validate_program_exists(command):
     p = check_call("command -v %s" % command, shell=True, stdout=DEVNULL, stderr=DEVNULL)
@@ -173,8 +169,9 @@ def dispatch(args):
     validate_directory(args.stats, dispatch_log)
     validate_directory(args.bam_dir, dispatch_log)
 
-    if args.scythe and args.adapter is None:
-        raise argparse.ArgumentError("with --scythe, --adapter needs to be specified.")
+    if (args.scythe and args.adapter is None) or (args.adapter is not None and not os.path.isfile(args.adapter)):
+        logger.critical("adapter file for Scythe no specified, or does not exist.")
+        sys.exit(1)
 
     # create sample config JSON file, starting off with global config passed through args
     global_sample_config = dict(reference=args.ref, adapters_file=args.adapter,
@@ -185,7 +182,7 @@ def dispatch(args):
     # which preprocess steps to use
     global_sample_config["preprocess-steps"] = list()
     for step in PREPROCESSING_STEPS:
-        if step in args:
+        if step in args and args.__getattribute__(step):
             global_sample_config["preprocess-steps"].append(step)
 
     global_params = dict(global_sample_config.items() + setup_params.items())
@@ -205,6 +202,7 @@ def dispatch(args):
         # now, start the batch script
         dispatch_log.info("submitting sbatch script '%s'." % batch_file)
         sbatch_cmd = ["sbatch"]
+
         if args.email is not None:
             sbatch_cmd.extend(["--mail-type", "ALL"])
             sbatch_cmd.extend(["--mail-user", args.email])
@@ -214,6 +212,20 @@ def dispatch(args):
             dispatch_log.critical("submitting batch script '%s' exited abnormally with return code %d." % (batch_file, retcode))
             sys.exit(retcode.returncode)
         dispatch_log.info("submitting sbatch script '%s' complete." % batch_file)
+
+def run_command_on_sample(cmd, logger, sample, desc):
+    logger.info("%s starting %s" % (sample, desc))
+    logger.info("%s command: %s" % (sample, cmd))
+    tstart = datetime.datetime.now()
+    p = Popen(cmd, shell=True, executable=find_bash())
+    p.wait()
+    if p.returncode != 0:
+        # make this as loud as possible so Slurm can handle it
+        logger.critical("%s exited abnormally with return code %d." % (sample, p.returncode))
+        sys.exit(p.returncode)
+    tend = datetime.datetime.now()
+    elapsed = tend - tstart
+    logger.info("%s completed %s in: %s" % (sample, desc, str(elapsed)))
 
 def runner(args):
     """
@@ -228,34 +240,19 @@ def runner(args):
 
     sample = sample_params["sample_id"]
     runner_log = Logger("%s logger" % sample)
+    tstart = datetime.datetime.now() # total run time
 
     # preprocessing and alignment
-    aln_cmd = build_sample_command(sample_params)
-
-    runner_log.info("%s starting preprocessing and alignment of sample." % sample)
-    runner_log.info("%s command: %s" % (sample, aln_cmd))
+    aln_cmd = build_sample_aln_command(sample_params)
+    run_command_on_sample(aln_cmd, runner_log, sample, desc="preprocessing and alignment")
     if args.dry_run:
         return
 
-    tstart = datetime.datetime.now()
-    p = Popen(aln_cmd, shell=True, executable=find_bash())
-    p.wait()
-    if p.returncode != 0:
-        # make this as loud as possible so Slurm can handle it
-        runner_log.critical("%s exited abnormally with return code %d." % (sample, p.returncode))
-        sys.exit(p.returncode)
-    tend = datetime.datetime.now()
-    elapsed = tend - tstart
-    runner_log.info("%s completed preprocessing and alignment in: %s" % (sample, str(elapsed)))
-
-    tstart = datetime.datetime.now()
-    # BAM file sort
     sort_cmd = safe_templater(SORT_STEPS['samtools-sort'], sample_params)
-    runner_log.info("%s starting sorting of BAM file." % sample)
-    runner_log.info("%s command: %s" % (sample, sort_cmd))
+    run_command_on_sample(sort_cmd, runner_log, sample, desc="sorting BAM file")
     tend = datetime.datetime.now()
     elapsed = tend - tstart
-    runner_log.info("%s completed sorting in: %s." % (sample, str(elapsed)))
+    runner_log.info("%s all processing completed in: %s." % (sample, str(elapsed)))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Dispatch a set of samples to be preprocessed and aligned.')
